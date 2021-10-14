@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+
+set -e
+
+if [[ $USER != thelounge ]]; then
+    echo "FATAL: Don't run this script as $USER, run this script as" \
+         "thelounge instead."
+    exit 1
+fi
+
+THELOUNGE_INSTALL_ROOT="${THELOUNGE_INSTALL_ROOT-/opt/thelounge}"
+
+function check_unowned_files {
+    local UNOWNED_FILES
+    UNOWNED_FILES="$(
+        find "$THELOUNGE_INSTALL_ROOT" \
+            ! \( -user thelounge -a -group thelounge \) | wc -l)"
+    if [[ $UNOWNED_FILES -gt 0 ]]; then
+        echo "FATAL: Found $UNOWNED_FILES unowned files. Run (as root) to fix:"
+        echo "chown -hR thelounge:thelounge '$THELOUNGE_INSTALL_ROOT'"
+        exit 1
+    fi
+}
+
+function get_pid {
+    local PID_FILE="$THELOUNGE_INSTALL_ROOT/.thelounge.pid"
+    if [[ -f $PID_FILE ]]; then
+        local PID
+        PID="$(cat "$PID_FILE")"
+        if ps -p "$PID" > /dev/null; then
+            printf "%s" "$PID"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+function status {
+    local PID
+    PID="$(get_pid)"
+    if [[ -n $PID ]]; then
+        echo "NOTICE: thelounge is running (PID=$PID)."
+    else
+        echo "NOTICE: thelounge is not running."
+    fi
+}
+
+function stop {
+    echo "INFO: Stopping thelounge."
+    local PID
+    PID="$(get_pid)"
+    if [[ -n $PID ]]; then
+        kill "$PID"
+
+        echo "INFO: Sent SIGTERM to PID $PID. Waiting for process to exit."
+        while get_pid > /dev/null; do
+            sleep 2
+            echo "INFO:    checking..."
+        done
+        rm "$THELOUNGE_INSTALL_ROOT/.thelounge.pid"
+        echo "NOTICE: thelounge has stopped."
+    else
+        echo "FATAL: thelounge is not running."
+        exit 1
+    fi
+}
+
+function get_repo_sha {
+    # shellcheck disable=SC2012
+    ls -alR --full-time "$THELOUNGE_INSTALL_ROOT/repo" | \
+        sha1sum | cut -d " " -f 1
+}
+
+function build {
+    echo "INFO: Building thelounge."
+    (
+        set -x
+        cd "$THELOUNGE_INSTALL_ROOT/repo"
+        yarn install
+        NODE_ENV=production yarn build
+    )
+    get_repo_sha > "$THELOUNGE_INSTALL_ROOT/.thelounge-last-build-sha.txt"
+    echo "NOTICE: Build succeeded."
+}
+
+function start {
+    echo "INFO: Starting the lounge"
+
+    if get_pid > /dev/null; then
+        echo "FATAL: Lounge already started."
+        exit 1
+    fi
+
+    local SHA_FILE="$THELOUNGE_INSTALL_ROOT/.thelounge-last-build-sha.txt"
+    if [[ ! -f $SHA_FILE || $(cat "$SHA_FILE") != $(get_repo_sha) ]]; then
+        echo "INFO: Detected changes in repo."
+        build
+    fi
+
+    (
+        export THELOUNGE_HOME="$THELOUNGE_INSTALL_ROOT/home"
+        nohup node "$THELOUNGE_INSTALL_ROOT/repo/index" start \
+            >> "$THELOUNGE_INSTALL_ROOT/thelounge.log" 2>&1 &
+        echo $! > "$THELOUNGE_INSTALL_ROOT/.thelounge.pid"
+    )
+    echo "NOTICE: started thelounge"
+}
+
+check_unowned_files
+
+case $1 in
+
+    status)
+        status
+        ;;
+
+    start)
+        start
+        ;;
+
+    forcebuild)
+        build
+        ;;
+
+    stop)
+        stop
+        ;;
+
+    *)
+        echo "USAGE: $0 start|stop|status|forcebuild"
+        exit 1
+        ;;
+
+esac
